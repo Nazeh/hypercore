@@ -170,14 +170,15 @@ module.exports = class Hypercore extends EventEmitter {
     }
 
     const directory = storage
-    const toLock = opts.lock || 'oplog'
+    const toLock = opts.unlocked ? null : (opts.lock || 'oplog')
+    const pool = opts.pool || (opts.poolSize ? RAF.createPool(opts.poolSize) : null)
 
     return createFile
 
     function createFile (name) {
-      const lock = isFile(name, toLock)
+      const lock = toLock === null ? false : isFile(name, toLock)
       const sparse = isFile(name, 'data') || isFile(name, 'bitfield') || isFile(name, 'tree')
-      return new RAF(name, { directory, lock, sparse })
+      return new RAF(name, { directory, lock, sparse, pool: lock ? null : pool })
     }
 
     function isFile (name, n) {
@@ -241,14 +242,19 @@ module.exports = class Hypercore extends EventEmitter {
   async _openFromExisting (from, opts) {
     await from.opening
 
-    this._passCapabilities(from)
-    this.sessions = from.sessions
+    // includes ourself as well, so the loop below also updates us
+    const sessions = this.sessions
+
+    for (const s of sessions) {
+      s.sessions = from.sessions
+      s.sessions.push(s)
+      s._passCapabilities(from)
+    }
+
     this.storage = from.storage
     this.replicator.findingPeers += this._findingPeers
 
     ensureEncryption(this, opts)
-
-    this.sessions.push(this)
   }
 
   async _openSession (key, storage, opts) {
@@ -423,27 +429,28 @@ module.exports = class Hypercore extends EventEmitter {
     const protocolStream = Hypercore.createProtocolStream(isInitiator, opts)
     const noiseStream = protocolStream.noiseStream
     const protocol = noiseStream.userData
+    const useSession = !!opts.session
 
-    this._attachToMuxer(protocol, opts)
+    this._attachToMuxer(protocol, useSession)
 
     return protocolStream
   }
 
-  _attachToMuxer (mux, opts) {
-    // If the user wants to, we can make this replication run in a session
-    // that way the core wont close "under them" during replication
-    if (opts.session) {
-      const s = this.session()
-      mux.stream.on('close', () => s.close().catch(noop))
-    }
-
+  _attachToMuxer (mux, useSession) {
     if (this.opened) {
-      this.replicator.attachTo(mux)
+      this._attachToMuxerOpened(mux, useSession)
     } else {
-      this.opening.then(() => this.replicator.attachTo(mux), mux.destroy.bind(mux))
+      this.opening.then(this._attachToMuxerOpened.bind(this, mux, useSession), mux.destroy.bind(mux))
     }
 
     return mux
+  }
+
+  _attachToMuxerOpened (mux, useSession) {
+    // If the user wants to, we can make this replication run in a session
+    // that way the core wont close "under them" during replication
+    const session = useSession ? this.session() : null
+    this.replicator.attachTo(mux, session)
   }
 
   get discoveryKey () {
@@ -610,7 +617,7 @@ module.exports = class Hypercore extends EventEmitter {
   async info () {
     if (this.opened === false) await this.opening
 
-    return Info.from(this.core, this.padding, this._snapshot)
+    return Info.from(this)
   }
 
   async update (opts) {
@@ -659,10 +666,15 @@ module.exports = class Hypercore extends EventEmitter {
     return req.promise
   }
 
-  async has (index) {
+  async has (start, end = start + 1) {
     if (this.opened === false) await this.opening
 
-    return this.core.bitfield.get(index)
+    const length = end - start
+    if (length <= 0) return false
+    if (length === 1) return this.core.bitfield.get(start)
+
+    const i = this.core.bitfield.firstUnset(start)
+    return i === -1 || i >= end
   }
 
   async get (index, opts) {
@@ -803,7 +815,7 @@ module.exports = class Hypercore extends EventEmitter {
   async treeHash (length) {
     if (length === undefined) {
       await this.ready()
-      length = this.core.length
+      length = this.core.tree.length
     }
 
     const roots = await this.core.tree.getRoots(length)

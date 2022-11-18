@@ -1,3 +1,6 @@
+const fs = require('fs')
+const path = require('path')
+const os = require('os')
 const Hypercore = require('../../')
 const RAM = require('random-access-memory')
 
@@ -22,9 +25,9 @@ exports.createStored = function createStored () {
   }
 }
 
-exports.replicate = function replicate (a, b, t) {
-  const s1 = a.replicate(true, { keepAlive: false })
-  const s2 = b.replicate(false, { keepAlive: false })
+exports.replicate = function replicate (a, b, t, opts) {
+  const s1 = a.replicate(true, { keepAlive: false, ...opts })
+  const s2 = b.replicate(false, { keepAlive: false, ...opts })
   s1.on('error', err => t.comment(`replication stream error (initiator): ${err}`))
   s2.on('error', err => t.comment(`replication stream error (responder): ${err}`))
   s1.pipe(s2).pipe(s1)
@@ -43,4 +46,11 @@ exports.unreplicate = function unreplicate (streams) {
 
 exports.eventFlush = async function eventFlush () {
   await new Promise(resolve => setImmediate(resolve))
+}
+
+exports.createTmpDir = function createTmpDir (teardown) {
+  const tmpdir = path.join(os.tmpdir(), 'hypercore-test-')
+  const dir = fs.mkdtempSync(tmpdir)
+  if (teardown) teardown(() => fs.rmSync(dir, { recursive: true }))
+  return dir
 }

@@ -2,6 +2,7 @@ const test = require('brittle')
 const b4a = require('b4a')
 const NoiseSecretStream = require('@hyperswarm/secret-stream')
 const { create, replicate, unreplicate, eventFlush } = require('./helpers')
+const Hypercore = require('../')
 
 test('basic replication', async function (t) {
   const a = await create()
@@ -289,6 +290,84 @@ test('multiplexing with external noise stream', async function (t) {
   a2.replicate(n1, { keepAlive: false })
   b1.replicate(n2, { keepAlive: false })
   b2.replicate(n2, { keepAlive: false })
+
+  await a1.append('hi')
+  t.alike(await b1.get(0), Buffer.from('hi'))
+
+  await a2.append('ho')
+  t.alike(await b2.get(0), Buffer.from('ho'))
+})
+
+test('multiplexing with createProtocolStream (ondiscoverykey is not called)', async function (t) {
+  t.plan(2)
+
+  const a1 = await create()
+  const a2 = await create()
+
+  const b1 = await create(a1.key)
+  const b2 = await create(a2.key)
+
+  const n1 = new NoiseSecretStream(true)
+  const n2 = new NoiseSecretStream(false)
+  n1.rawStream.pipe(n2.rawStream).pipe(n1.rawStream)
+
+  const stream1 = Hypercore.createProtocolStream(n1, {
+    ondiscoverykey: function (discoveryKey) {
+      t.fail()
+    }
+  })
+  const stream2 = Hypercore.createProtocolStream(n2, {
+    ondiscoverykey: function (discoveryKey) {
+      t.fail()
+    }
+  })
+
+  a1.replicate(stream1, { keepAlive: false })
+  a2.replicate(stream1, { keepAlive: false })
+  b1.replicate(stream2, { keepAlive: false })
+  b2.replicate(stream2, { keepAlive: false })
+
+  await a1.append('hi')
+  t.alike(await b1.get(0), Buffer.from('hi'))
+
+  await a2.append('ho')
+  t.alike(await b2.get(0), Buffer.from('ho'))
+})
+
+test('multiplexing with createProtocolStream (ondiscoverykey is called)', async function (t) {
+  t.plan(4)
+
+  const a1 = await create()
+  const a2 = await create()
+
+  const b1 = await create(a1.key)
+  const b2 = await create(a2.key)
+
+  const n1 = new NoiseSecretStream(true)
+  const n2 = new NoiseSecretStream(false)
+  n1.rawStream.pipe(n2.rawStream).pipe(n1.rawStream)
+
+  const stream1 = Hypercore.createProtocolStream(n1, {
+    ondiscoverykey: function (discoveryKey) {
+      if (a1.discoveryKey.equals(discoveryKey)) {
+        a1.replicate(stream1, { keepAlive: false })
+        t.pass()
+      }
+
+      if (a2.discoveryKey.equals(discoveryKey)) {
+        a2.replicate(stream1, { keepAlive: false })
+        t.pass()
+      }
+    }
+  })
+  const stream2 = Hypercore.createProtocolStream(n2, {
+    ondiscoverykey: function (discoveryKey) {
+      t.fail()
+    }
+  })
+
+  b1.replicate(stream2, { keepAlive: false })
+  b2.replicate(stream2, { keepAlive: false })
 
   await a1.append('hi')
   t.alike(await b1.get(0), Buffer.from('hi'))
@@ -879,4 +958,84 @@ test('replicate to writable cores after clearing', async function (t) {
   const c = await a.get(2)
 
   t.alike(c, b4a.from('c'))
+})
+
+test('large linear download', async function (t) {
+  const n = 1000
+
+  const a = await create()
+
+  for (let i = 0; i < n; i++) await a.append(i.toString())
+
+  const b = await create(a.key)
+
+  let d = 0
+  b.on('download', () => d++)
+
+  replicate(a, b, t)
+
+  const r = b.download({ start: 0, end: n, linear: true })
+
+  await r.done()
+
+  t.is(d, 1000)
+})
+
+test('replication session', async function (t) {
+  const a = await create()
+  const b = await create(a.key)
+
+  await a.append(['a', 'b', 'c', 'd', 'e'])
+
+  const [s1, s2] = replicate(a, b, t, { session: true })
+
+  t.is(a.sessions.length, 2)
+  t.is(b.sessions.length, 2)
+
+  s1.destroy()
+  s2.destroy()
+
+  await Promise.all([new Promise(resolve => s1.on('close', resolve)), new Promise(resolve => s2.on('close', resolve))])
+
+  t.is(a.sessions.length, 1)
+  t.is(b.sessions.length, 1)
+})
+
+test('replication session after stream opened', async function (t) {
+  const a = await create()
+  const b = await create(a.key)
+
+  await a.append(['a', 'b', 'c', 'd', 'e'])
+
+  const [s1, s2] = replicate(a, b, t, { session: true })
+
+  await s1.noiseStream.opened
+  await s2.noiseStream.opened
+
+  t.is(a.sessions.length, 2)
+  t.is(b.sessions.length, 2)
+
+  s1.destroy()
+  s2.destroy()
+
+  await Promise.all([new Promise(resolve => s1.on('close', resolve)), new Promise(resolve => s2.on('close', resolve))])
+
+  t.is(a.sessions.length, 1)
+  t.is(b.sessions.length, 1)
+})
+
+test('replication session keeps the core open', async function (t) {
+  const a = await create()
+  const b = await create(a.key)
+
+  await a.append(['a', 'b', 'c', 'd', 'e'])
+
+  replicate(a, b, t, { session: true })
+
+  await a.close()
+  await eventFlush()
+
+  const blk = await b.get(2)
+
+  t.alike(blk, b4a.from('c'), 'still replicating due to session')
 })
